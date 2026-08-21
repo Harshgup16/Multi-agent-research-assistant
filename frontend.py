@@ -25,7 +25,7 @@ def safe_slug(title: str) -> str:
     s = title.strip().lower()
     s = re.sub(r"[^a-z0-9 _-]+", "", s)
     s = re.sub(r"\s+", "_", s).strip("_")
-    return s or "blog"
+    return s or "report"
 
 
 def try_stream(graph_app, inputs: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
@@ -139,7 +139,7 @@ def render_markdown_with_local_images(md: str):
 
 
 # -----------------------------
-# Removed local file past blogs helpers for cloud compat
+# Removed local file past reports helpers for cloud compat
 # -----------------------------
 
 
@@ -157,18 +157,18 @@ def extract_title_from_md(md: str, fallback: str) -> str:
 # -----------------------------
 # Streamlit UI
 # -----------------------------
-st.set_page_config(page_title="LangGraph Blog Writer", layout="wide")
+st.set_page_config(page_title="LangGraph Research Intelligence Portal", layout="wide")
 
-st.title("Blog Writing Agent")
+st.title("Multi-Agent Research Intelligence Synthesizer")
 
 with st.sidebar:
-    st.header("Generate New Blog")
+    st.header("Compose Research Report")
     topic = st.text_area(
         "Topic",
         height=120,
     )
     as_of = st.date_input("As-of date", value=date.today())
-    run_btn = st.button("🚀 Generate Blog", type="primary")
+    run_btn = st.button("🚀 Generate Report", type="primary")
 
     st.divider()
 
@@ -261,11 +261,11 @@ if out:
             else:
                 plan_dict = json.loads(json.dumps(plan_obj, default=str))
 
-            st.write("**Title:**", plan_dict.get("blog_title"))
+            st.write("**Report Title:**", plan_dict.get("blog_title"))
             cols = st.columns(3)
             cols[0].write("**Audience:** " + str(plan_dict.get("audience")))
             cols[1].write("**Tone:** " + str(plan_dict.get("tone")))
-            cols[2].write("**Blog kind:** " + str(plan_dict.get("blog_kind", "")))
+            cols[2].write("**Report Format:** " + str(plan_dict.get("blog_kind", "")))
 
             tasks = plan_dict.get("tasks", [])
             if tasks:
@@ -320,16 +320,16 @@ if out:
 
             plan_obj = out.get("plan")
             if hasattr(plan_obj, "blog_title"):
-                blog_title = plan_obj.blog_title
+                report_title = plan_obj.blog_title
             elif isinstance(plan_obj, dict):
-                blog_title = plan_obj.get("blog_title", "blog")
+                report_title = plan_obj.get("blog_title", "report")
             else:
                 # fallback: parse from markdown title
-                blog_title = extract_title_from_md(final_md, "blog")
+                report_title = extract_title_from_md(final_md, "report")
 
-            md_filename = f"{safe_slug(blog_title)}.md"
+            md_filename = f"{safe_slug(report_title)}.md"
             st.download_button(
-                "⬇️ Download Markdown",
+                "⬇️ Download Report (Markdown)",
                 data=final_md.encode("utf-8"),
                 file_name=md_filename,
                 mime="text/markdown",
@@ -347,4 +347,4 @@ if out:
 
         st.text_area("Event log", value="\n\n".join(st.session_state["logs"][-80:]), height=520)
 else:
-    st.info("Enter a topic and click **Generate Blog**.")
+    st.info("Enter a topic and click **Generate Report** to begin the synthesis process.")
