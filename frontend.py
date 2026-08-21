@@ -30,27 +30,26 @@ def safe_slug(title: str) -> str:
 
 def try_stream(graph_app, inputs: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
     """
-    Stream graph progress if available; else invoke.
-    Yields ("updates"/"values"/"final", payload).
+    Stream graph progress. The stream() call already runs the full graph,
+    so we must NOT call invoke() afterwards (that would re-run everything).
+    Yields ("updates", payload) per node, then ("final", accumulated_state).
     """
+    accumulated: Dict[str, Any] = dict(inputs)
+
     try:
         for step in graph_app.stream(inputs, stream_mode="updates"):
             yield ("updates", step)
-        out = graph_app.invoke(inputs)
-        yield ("final", out)
+            # Merge each node's output into accumulated state
+            if isinstance(step, dict):
+                for node_name, node_output in step.items():
+                    if isinstance(node_output, dict):
+                        accumulated.update(node_output)
+        yield ("final", accumulated)
         return
     except Exception:
         pass
 
-    try:
-        for step in graph_app.stream(inputs, stream_mode="values"):
-            yield ("values", step)
-        out = graph_app.invoke(inputs)
-        yield ("final", out)
-        return
-    except Exception:
-        pass
-
+    # Fallback: just invoke once
     out = graph_app.invoke(inputs)
     yield ("final", out)
 
@@ -204,8 +203,6 @@ if run_btn:
         "recency_days": 7,
         "sections": [],
         "merged_md": "",
-        "md_with_placeholders": "",
-        "image_specs": [],
         "final": "",
     }
 

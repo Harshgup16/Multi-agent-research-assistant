@@ -3,10 +3,11 @@ from __future__ import annotations
 import operator
 import os
 import re
+import json
 import base64
 from datetime import date, timedelta
 from pathlib import Path
-from typing import TypedDict, List, Optional, Literal, Annotated
+from typing import TypedDict, List, Optional, Literal, Annotated, Union, Dict, Any
 
 from pydantic import BaseModel, Field
 
@@ -30,11 +31,11 @@ load_dotenv()
 # 1) Schemas
 # -----------------------------
 class Task(BaseModel):
-    id: int
-    title: str
-    goal: str = Field(..., description="One sentence describing what the reader should do/understand.")
-    bullets: List[str] = Field(..., min_length=3, max_length=6)
-    target_words: int = Field(..., description="Target words (120–550).")
+    id: int = Field(default=1)
+    title: str = Field(default="Section Title")
+    goal: str = Field(default="Understand key details", description="One sentence describing what the reader should do/understand.")
+    bullets: List[str] = Field(default_factory=list)
+    target_words: int = Field(default=300, description="Target words (120–550).")
 
     tags: List[str] = Field(default_factory=list)
     requires_research: bool = False
@@ -43,26 +44,26 @@ class Task(BaseModel):
 
 
 class Plan(BaseModel):
-    blog_title: str
-    audience: str
-    tone: str
-    blog_kind: Literal["explainer", "tutorial", "news_roundup", "comparison", "system_design"] = "explainer"
-    constraints: List[str] = Field(default_factory=list)
-    tasks: List[Task]
+    blog_title: str = "Technical Blog Outline"
+    audience: str = "Software Engineers & Developers"
+    tone: str = "Informative and technical"
+    blog_kind: str = "explainer"
+    constraints: Union[List[Any], Dict[str, Any], Any] = Field(default_factory=list)
+    tasks: List[Task] = Field(default_factory=list)
 
 
 class EvidenceItem(BaseModel):
-    title: str
-    url: str
+    title: str = ""
+    url: str = ""
     published_at: Optional[str] = None  # ISO "YYYY-MM-DD" preferred
     snippet: Optional[str] = None
     source: Optional[str] = None
 
 
 class RouterDecision(BaseModel):
-    needs_research: bool
-    mode: Literal["closed_book", "hybrid", "open_book"]
-    reason: str
+    needs_research: bool = True
+    mode: Literal["closed_book", "hybrid", "open_book"] = "hybrid"
+    reason: Optional[str] = ""
     queries: List[str] = Field(default_factory=list)
     max_results_per_query: int = Field(5)
 
@@ -100,16 +101,18 @@ class State(TypedDict):
 # -----------------------------
 # Groq 1 for structured output
 groq_llm_1 = ChatGroq(
-    model="llama-3.3-70b-versatile",
+    model=os.getenv("GROQ_MODEL_1", "openai/gpt-oss-20b"),
     api_key=os.getenv("GROQ_API_KEY"),
     temperature=0,
+    max_retries=5,
 )
 
 # Groq 2 for worker text generation
 groq_llm_2 = ChatGroq(
-    model="llama-3.3-70b-versatile",
-    api_key=os.getenv("GROQ_API_KEY_2"),
+    model=os.getenv("GROQ_MODEL_2", "openai/gpt-oss-20b"),
+    api_key=os.getenv("GROQ_API_KEY_2") or os.getenv("GROQ_API_KEY"),
     temperature=0,
+    max_retries=5,
 )
 
 # -----------------------------
@@ -127,16 +130,29 @@ Modes:
 If needs_research=true:
 - Output 3–10 high-signal, scoped queries.
 - For open_book weekly roundup, include queries reflecting last 7 days.
+
+Return your response in valid JSON with keys: "needs_research" (boolean), "mode" ("closed_book"|"hybrid"|"open_book"), "reason" (string), and "queries" (list of strings).
 """
 
+def _parse_json(text: str) -> dict:
+    """Extract the first JSON object from LLM text output."""
+    match = re.search(r"\{.*\}", str(text), re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+    return {}
+
+
 def router_node(state: State) -> dict:
-    decider = groq_llm_1.with_structured_output(RouterDecision)
-    decision = decider.invoke(
-        [
-            SystemMessage(content=ROUTER_SYSTEM),
-            HumanMessage(content=f"Topic: {state['topic']}\nAs-of date: {state['as_of']}"),
-        ]
-    )
+    messages = [
+        SystemMessage(content=ROUTER_SYSTEM),
+        HumanMessage(content=f"Topic: {state['topic']}\nAs-of date: {state['as_of']}"),
+    ]
+    raw = groq_llm_1.invoke(messages).content
+    data = _parse_json(raw)
+    decision = RouterDecision(**data)
 
     if decision.mode == "open_book":
         recency_days = 7
@@ -169,8 +185,8 @@ def _tavily_search(query: str, max_results: int = 5) -> List[dict]:
         for r in results or []:
             snippet = r.get("content") or r.get("snippet") or ""
             # Limit snippet length to avoid TPM limit errors
-            if len(snippet) > 400:
-                snippet = snippet[:400] + "..."
+            if len(snippet) > 200:
+                snippet = snippet[:200] + "..."
 
             out.append(
                 {
@@ -203,35 +219,34 @@ Rules:
 - Normalize published_at to ISO YYYY-MM-DD if reliably inferable; else null (do NOT guess).
 - Keep snippets short.
 - Deduplicate by URL.
+
+Return your response in valid JSON formatted as a JSON object with key "evidence" containing a list of objects with fields "title", "url", "published_at", "snippet", "source".
 """
 
 def research_node(state: State) -> dict:
-    # Limit queries to 4 to reduce token usage
-    queries = (state.get("queries") or [])[:4]
+    queries = (state.get("queries") or [])[:3]
     raw: List[dict] = []
     for q in queries:
-        # Limit results per query to 3
-        raw.extend(_tavily_search(q, max_results=3))
+        raw.extend(_tavily_search(q, max_results=2))
 
+    raw = raw[:6]
     if not raw:
         return {"evidence": []}
 
-    extractor = groq_llm_1.with_structured_output(EvidencePack)
-    pack = extractor.invoke(
-        [
-            SystemMessage(content=RESEARCH_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"As-of date: {state['as_of']}\n"
-                    f"Recency days: {state['recency_days']}\n\n"
-                    f"Raw results:\n{raw}"
-                )
-            ),
-        ]
-    )
+    # Skip LLM extraction — just convert raw Tavily results directly
+    evidence_items = [
+        EvidenceItem(
+            title=r.get("title") or "",
+            url=r.get("url") or "",
+            snippet=(r.get("snippet") or "")[:200],
+            source=r.get("source") or "",
+            published_at=r.get("published_at"),
+        )
+        for r in raw
+    ]
 
     dedup = {}
-    for e in pack.evidence:
+    for e in evidence_items:
         if e.url:
             dedup[e.url] = e
     evidence = list(dedup.values())
@@ -250,7 +265,12 @@ ORCH_SYSTEM = """You are a senior technical writer and developer advocate.
 Produce a highly actionable outline for a technical blog post.
 
 Requirements:
-- 5–9 tasks, each with goal + 3–6 bullets + target_words.
+- 5–9 tasks (sections). Each task MUST include:
+  * "id": integer starting from 1 (1, 2, 3, ...)
+  * "title": a specific, descriptive, and engaging section title (e.g. "Overview of RAG Architecture", "Top 2026 Framework Comparison", "Enterprise Use Cases", etc.). NEVER use generic titles like "Section Title" or "Section".
+  * "goal": one sentence goal describing what the reader should understand.
+  * "bullets": 3–6 specific bullet points to cover in this section.
+  * "target_words": integer word count (120–550).
 - Tags are flexible; do not force a fixed taxonomy.
 
 Grounding:
@@ -261,30 +281,66 @@ Grounding:
   - No tutorial content unless requested
   - If evidence is weak, plan should explicitly reflect that (don’t invent events).
 
-Output must match Plan schema.
+Return your output as a valid JSON object matching the Plan schema with keys: "blog_title", "audience", "tone", "blog_kind", "constraints", and "tasks".
 """
 
 def orchestrator_node(state: State) -> dict:
-    planner = groq_llm_1.with_structured_output(Plan)
     mode = state.get("mode", "closed_book")
     evidence = state.get("evidence", [])
-
     forced_kind = "news_roundup" if mode == "open_book" else None
 
-    plan = planner.invoke(
-        [
-            SystemMessage(content=ORCH_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"Topic: {state['topic']}\n"
-                    f"Mode: {mode}\n"
-                    f"As-of: {state['as_of']} (recency_days={state['recency_days']})\n"
-                    f"{'Force blog_kind=news_roundup' if forced_kind else ''}\n\n"
-                    f"Evidence:\n{[e.model_dump() for e in evidence][:8]}"
-                )
-            ),
-        ]
-    )
+    messages = [
+        SystemMessage(content=ORCH_SYSTEM),
+        HumanMessage(
+            content=(
+                f"Topic: {state['topic']}\n"
+                f"Mode: {mode}\n"
+                f"As-of: {state['as_of']} (recency_days={state['recency_days']})\n"
+                f"{'Force blog_kind=news_roundup' if forced_kind else ''}\n\n"
+                f"Evidence:\n{[e.model_dump() for e in evidence][:8]}"
+            )
+        ),
+    ]
+
+    raw = groq_llm_1.invoke(messages).content
+    plan = _parse_json(raw)
+    if isinstance(plan, dict):
+        constraints_raw = plan.get("constraints")
+        if isinstance(constraints_raw, dict):
+            plan["constraints"] = [f"{k}: {v}" for k, v in constraints_raw.items()]
+        elif isinstance(constraints_raw, str):
+            plan["constraints"] = [constraints_raw]
+
+        tasks_raw = plan.get("tasks", [])
+        for idx, t in enumerate(tasks_raw):
+            if isinstance(t, dict):
+                t["id"] = idx + 1
+                title_val = t.get("title") or t.get("name") or t.get("section_title") or t.get("header") or ""
+                if not title_val or title_val.strip().lower() in ["section title", "section", "untitled", "task title"]:
+                    goal_text = t.get("goal", "")
+                    bullets = t.get("bullets", [])
+                    if goal_text:
+                        clean_goal = goal_text.split(".")[0].strip()
+                        title_val = clean_goal[:60]
+                    elif bullets:
+                        title_val = bullets[0][:60]
+                    else:
+                        title_val = f"Key Takeaways Part {idx + 1}"
+                t["title"] = title_val
+        plan = Plan(**plan)
+    elif hasattr(plan, "tasks"):
+        if isinstance(getattr(plan, "constraints", None), dict):
+            plan.constraints = [f"{k}: {v}" for k, v in plan.constraints.items()]
+        for idx, task in enumerate(plan.tasks):
+            task.id = idx + 1
+            if not task.title or task.title.strip().lower() in ["section title", "section", "untitled", "task title"]:
+                if task.goal:
+                    clean_goal = task.goal.split(".")[0].strip()
+                    task.title = clean_goal[:60]
+                elif task.bullets:
+                    task.title = task.bullets[0][:60]
+                else:
+                    task.title = f"Key Takeaways Part {idx + 1}"
     if forced_kind:
         plan.blog_kind = "news_roundup"
 
@@ -321,7 +377,7 @@ Write ONE section of a technical blog post in Markdown.
 Constraints:
 - Cover ALL bullets in order.
 - Target words ±15%.
-- Output only section markdown starting with "## <Section Title>".
+- Output must start with the section title header: "## <Section Title>" using the exact Section Title provided in the prompt (e.g. ## Overview of Modern RAG Architecture).
 
 Scope guard:
 - If blog_kind=="news_roundup", do NOT drift into tutorials (scraping/RSS/how to fetch).
